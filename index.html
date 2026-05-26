@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>指尖水果消消乐 - 手势交互系统</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            background: #ffffff;
+            overflow: hidden;
+            font-family: 'Segoe UI', 'Poppins', 'Inter', system-ui, -apple-system, 'Helvetica Neue', sans-serif;
+            touch-action: none; /* 优化触屏，避免滚动干扰 */
+            position: fixed;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* 全屏画布 - 纯白背景 + 缤纷水果 */
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            display: block;
+            width: 100%;
+            height: 100%;
+            z-index: 10;
+            cursor: none; /* 隐藏默认指针，更沉浸 */
+        }
+
+        /* 简洁UI层 */
+        .ui-panel {
+            position: fixed;
+            bottom: 24px;
+            left: 0;
+            right: 0;
+            display: flex;
+            justify-content: center;
+            gap: 24px;
+            z-index: 20;
+            pointer-events: none;
+            font-weight: 500;
+            text-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+
+        .score-card {
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(12px);
+            border-radius: 60px;
+            padding: 10px 24px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.05), 0 0 0 1px rgba(0, 0, 0, 0.02);
+            font-size: 1.6rem;
+            font-weight: 700;
+            color: #2d3e2b;
+            letter-spacing: 1px;
+            pointer-events: none;
+            font-family: monospace;
+        }
+
+        .score-card span {
+            font-size: 1.9rem;
+            color: #ff6b4a;
+            margin-right: 6px;
+        }
+
+        .status-badge {
+            background: rgba(0, 0, 0, 0.55);
+            backdrop-filter: blur(8px);
+            border-radius: 40px;
+            padding: 6px 20px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: white;
+            letter-spacing: 0.5px;
+            pointer-events: none;
+            font-family: monospace;
+        }
+
+        .instruction {
+            position: fixed;
+            top: 20px;
+            left: 0;
+            right: 0;
+            text-align: center;
+            z-index: 20;
+            pointer-events: none;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: #6c7a6b;
+            background: rgba(255,255,240,0.7);
+            backdrop-filter: blur(4px);
+            width: fit-content;
+            margin: 0 auto;
+            padding: 6px 18px;
+            border-radius: 40px;
+            font-family: monospace;
+            letter-spacing: 0.3px;
+        }
+
+        @media (max-width: 600px) {
+            .score-card { padding: 6px 18px; font-size: 1.3rem; }
+            .score-card span { font-size: 1.6rem; }
+            .instruction { font-size: 0.7rem; top: 12px; }
+        }
+
+        /* 加载提示轻量遮罩 */
+        .loading-overlay {
+            position: fixed;
+            bottom: 30px;
+            left: 20px;
+            background: rgba(0,0,0,0.5);
+            backdrop-filter: blur(10px);
+            padding: 6px 14px;
+            border-radius: 50px;
+            z-index: 30;
+            font-size: 0.7rem;
+            color: white;
+            font-family: monospace;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+<canvas id="fruitCanvas" width="1000" height="1000"></canvas>
+
+<div class="ui-panel">
+    <div class="score-card">
+        <span>🍎</span> <span id="scoreValue">0</span>
+    </div>
+    <div class="status-badge" id="handStatus">✋ 等待手势</div>
+</div>
+<div class="instruction">
+    ✨ 食指空气墙 → 触碰水果即消失 ✨
+</div>
+<div class="loading-overlay" id="loadingMsg">
+    📷 启动摄像头中...
+</div>
+
+<!-- MediaPipe Hands 核心库 -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<!-- 引入辅助工具库（可选，用于简化相机调用，但我们将手动控制） -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+<script>
+    (function(){
+        // ---------- DOM 元素 ----------
+        const canvas = document.getElementById('fruitCanvas');
+        const ctx = canvas.getContext('2d');
+        const scoreSpan = document.getElementById('scoreValue');
+        const handStatusDiv = document.getElementById('handStatus');
+        const loadingMsgDiv = document.getElementById('loadingMsg');
+
+        // ---------- 全局参数 ----------
+        let fruits = [];            // 水果对象数组
+        let score = 0;             // 消除计数
+        let animationId = null;
+        let canvasWidth = window.innerWidth;
+        let canvasHeight = window.innerHeight;
+        
+        // 手势数据 (食指指尖像素坐标, 空气墙位置)
+        let indexFingerPos = null;      // { x, y } 像素坐标 (已镜像)
+        let handDetected = false;
+        
+        // 空气墙半径 (视觉表现 + 碰撞半径)
+        const AIR_WALL_RADIUS = 34;      // 碰撞范围舒适，手机上也容易触碰
+        // 水果基础半径范围
+        const FRUIT_MIN_R = 20;
+        const FRUIT_MAX_R = 30;
+        
+        // 下落速度基数
+        const BASE_SPEED = 1.8;
+        const SPEED_VARIANT = 1.2;
+        
+        // 生成水果控制
+        let frameCounter = 0;
+        const GENERATE_FRAME_INTERVAL = 28;  // 大约每28帧生成一颗 (约0.5秒60fps下)
+        const MAX_FRUITS = 28;
+        
+        // 颜色池 - 缤纷水果色
+        const COLOR_PALETTE = [
+            '#FF5252', '#FF8A65', '#FFB74D', '#FFD54F', '#AED581', '#81C784',
+            '#4FC3F7', '#64B5F6', '#BA68C8', '#F06292', '#FF8A80', '#E1BEE7',
+            '#FFF176', '#A1887F', '#E57373', '#9575CD'
+        ];
+        
+        // 水果图标装饰 (非必须，但增加趣味, 用简单渐变+高光模拟)
+        
+        // ---------- MediaPipe 相关 ----------
+        let hands = null;
+        let videoElement = null;
+        let cameraActive = false;
+        let lastDetectionTimestamp = 0;
+        let isModelLoading = true;
+        
+        // ---------- 辅助函数 ----------
+        function resizeCanvas() {
+            canvasWidth = window.innerWidth;
+            canvasHeight = window.innerHeight;
+            canvas.width = canvasWidth;
+            canvas.height = canvasHeight;
+            // 重新映射水果位置? (防止越界，直接重新映射所有现有水果位置以适配新尺寸)
+            if (fruits.length > 0) {
+                for (let f of fruits) {
+                    // 确保水果在新画布内: 如果超出右边界或左边界则微调, 且避免卡边界外
+                    f.x = Math.min(Math.max(f.x, f.radius + 5), canvasWidth - f.radius - 5);
+                    f.y = Math.min(Math.max(f.y, f.radius + 5), canvasHeight + 50);
+                }
+            }
+        }
+        
+        // 生成新水果 (随机位置顶部, 随机半径, 随机速度)
+        function createFruit() {
+            const radius = Math.floor(Math.random() * (FRUIT_MAX_R - FRUIT_MIN_R + 1) + FRUIT_MIN_R);
+            const x = Math.random() * (canvasWidth - radius * 2) + radius;
+            const y = -radius - Math.random() * 40;   // 从顶外入场
+            const vy = BASE_SPEED + Math.random() * SPEED_VARIANT;
+            const vx = (Math.random() - 0.5) * 0.6;    // 轻微飘移
+            const color = COLOR_PALETTE[Math.floor(Math.random() * COLOR_PALETTE.length)];
+            // 果蒂高光色
+            const highlight = '#FFF9C4';
+            return { x, y, radius, vy, vx, color, highlight };
+        }
+        
+        // 初始化/重置水果池 (开局几个水果)
+        function initFruits(count = 12) {
+            const newFruits = [];
+            for (let i = 0; i < count; i++) {
+                newFruits.push(createFruit());
+            }
+            return newFruits;
+        }
+        
+        // 更新水果位置 & 边界移除 (超出底部则消失，但不扣分)
+        function updateFruits() {
+            for (let i = 0; i < fruits.length; i++) {
+                const f = fruits[i];
+                f.x += f.vx;
+                f.y += f.vy;
+                // 水平边界反弹 (让水果更生动，不会跑出左右墙)
+                if (f.x - f.radius < 0) { f.x = f.radius; f.vx = -f.vx * 0.8; }
+                if (f.x + f.radius > canvasWidth) { f.x = canvasWidth - f.radius; f.vx = -f.vx * 0.8; }
+                // 超出底部或者超出顶部太远(超出顶部移除)
+                if (f.y - f.radius > canvasHeight + 100 || f.y + f.radius < -150) {
+                    fruits.splice(i,1);
+                    i--;
+                }
+            }
+            
+            // 动态补充水果, 维持有趣数量
+            if (fruits.length < MAX_FRUITS - 3 && frameCounter % 5 === 0) {
+                if (fruits.length < MAX_FRUITS) {
+                    fruits.push(createFruit());
+                }
+            }
+        }
+        
+        // 碰撞检测: 空气墙 (指尖位置) 与水果圆心距离
+        function checkCollisionAndRemove() {
+            if (!indexFingerPos || !handDetected) return 0;
+            const fingerX = indexFingerPos.x;
+            const fingerY = indexFingerPos.y;
+            let removedCount = 0;
+            for (let i = fruits.length-1; i >= 0; i--) {
+                const fruit = fruits[i];
+                const dx = fingerX - fruit.x;
+                const dy = fingerY - fruit.y;
+                const dist = Math.hypot(dx, dy);
+                // 空气墙半径 + 水果半径 = 碰撞阈值
+                const threshold = AIR_WALL_RADIUS + fruit.radius;
+                if (dist < threshold) {
+                    // 水果消失
+                    fruits.splice(i,1);
+                    removedCount++;
+                }
+            }
+            return removedCount;
+        }
+        
+        // 添加分数并更新UI
+        function addScore(inc) {
+            if (inc > 0) {
+                score += inc;
+                scoreSpan.innerText = score;
+                // 轻盈动画感: 轻微缩放 (通过css模拟)
+                const el = document.getElementById('scoreValue');
+                el.style.transform = 'scale(1.2)';
+                setTimeout(() => { if(el) el.style.transform = 'scale(1)'; }, 150);
+            }
+        }
+        
+        // 绘制一颗精致水果 (缤纷风格，带高光和叶子)
+        function drawFruit(f) {
+            ctx.save();
+            ctx.shadowBlur = 0;
+            ctx.beginPath();
+            ctx.arc(f.x, f.y, f.radius, 0, Math.PI * 2);
+            // 主色填充
+            ctx.fillStyle = f.color;
+            ctx.fill();
+            // 高光 更生动
+            ctx.beginPath();
+            ctx.arc(f.x - f.radius*0.25, f.y - f.radius*0.25, f.radius*0.2, 0, Math.PI*2);
+            ctx.fillStyle = 'rgba(255, 255, 240, 0.6)';
+            ctx.fill();
+            // 果蒂小梗
+            ctx.beginPath();
+            ctx.moveTo(f.x + f.radius*0.3, f.y - f.radius*0.5);
+            ctx.lineTo(f.x + f.radius*0.55, f.y - f.radius*0.85);
+            ctx.lineTo(f.x + f.radius*0.15, f.y - f.radius*0.7);
+            ctx.fillStyle = '#7d5535';
+            ctx.fill();
+            // 叶子
+            ctx.beginPath();
+            ctx.ellipse(f.x + f.radius*0.25, f.y - f.radius*0.7, f.radius*0.2, f.radius*0.13, 0.3, 0, Math.PI*2);
+            ctx.fillStyle = '#8bc34a';
+            ctx.fill();
+            // 小种子点
+            ctx.beginPath();
+            ctx.arc(f.x - f.radius*0.1, f.y + f.radius*0.1, f.radius*0.08, 0, Math.PI*2);
+            ctx.fillStyle = '#6d4c41';
+            ctx.fill();
+            ctx.restore();
+        }
+        
+        // 绘制空气墙 (食指上炫酷动态光圈 + 光晕)
+        function drawAirWall(x, y) {
+            if (!handDetected || !indexFingerPos) return;
+            
+            ctx.save();
+            ctx.shadowBlur = 0;
+            // 外圈光晕 (空气墙感)
+            ctx.beginPath();
+            ctx.arc(x, y, AIR_WALL_RADIUS + 3, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255, 240, 150, 0.2)';
+            ctx.fill();
+            // 主空气墙半透明渐变环
+            const gradient = ctx.createRadialGradient(x-4, y-4, 5, x, y, AIR_WALL_RADIUS);
+            gradient.addColorStop(0, 'rgba(255, 255, 210, 0.85)');
+            gradient.addColorStop(0.6, 'rgba(200, 230, 255, 0.65)');
+            gradient.addColorStop(1, 'rgba(130, 200, 255, 0.3)');
+            ctx.beginPath();
+            ctx.arc(x, y, AIR_WALL_RADIUS-2, 0, Math.PI*2);
+            ctx.fillStyle = gradient;
+            ctx.fill();
+            // 内圈高亮描边
+            ctx.beginPath();
+            ctx.arc(x, y, AIR_WALL_RADIUS-5, 0, Math.PI * 2);
+            ctx.strokeStyle = '#ffffffcc';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(x, y, AIR_WALL_RADIUS-10, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255, 250, 200, 0.7)';
+            ctx.fill();
+            // 中心食指小光点
+            ctx.beginPath();
+            ctx.arc(x, y, 6, 0, Math.PI*2);
+            ctx.fillStyle = '#fff9c4';
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(x, y, 3, 0, Math.PI*2);
+            ctx.fillStyle = '#ffd966';
+            ctx.fill();
+            ctx.restore();
+        }
+        
+        // 绘制纯净背景 + 所有元素
+        function drawScene() {
+            if (!ctx) return;
+            // 纯白色背景 (完全纯净)
+            ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+            
+            // 绘制所有水果
+            for (let fruit of fruits) {
+                drawFruit(fruit);
+            }
+            
+            // 绘制空气墙 (如果存在指尖)
+            if (indexFingerPos && handDetected) {
+                drawAirWall(indexFingerPos.x, indexFingerPos.y);
+            }
+            
+            // 轻量提示如果没有检测到手
+            if (!handDetected && !isModelLoading) {
+                ctx.font = '500 14px "Segoe UI", monospace';
+                ctx.fillStyle = '#aaaaaa';
+                ctx.shadowBlur = 0;
+                ctx.fillText('✋ 未检测到食指，请将手放在摄像头前', canvasWidth/2-160, canvasHeight-45);
+            }
+        }
+        
+        // ---- 核心逻辑: 每一帧更新和重绘 ----
+        let lastTimestamp = 0;
+        function updateLoop() {
+            // 更新水果运动
+            updateFruits();
+            // 检测碰撞并删除水果 (返回消除数量)
+            const removed = checkCollisionAndRemove();
+            if (removed > 0) {
+                addScore(removed);
+                // 碰撞时增加一点趣味性: 轻量震动感（可选，手机上可轻微震动，但需用户交互许可？但不强制，安全）
+                // 触碰时给视觉反馈就够了
+                // 额外: 补偿水果数量，避免太少 (保证游戏性)
+                for (let i = 0; i < Math.min(removed, 3); i++) {
+                    if (fruits.length < MAX_FRUITS + 5) fruits.push(createFruit());
+                }
+            }
+            
+            // 定时生成水果 (独立于碰撞)
+            frameCounter++;
+            if (frameCounter >= GENERATE_FRAME_INTERVAL && fruits.length < MAX_FRUITS + 3) {
+                frameCounter = 0;
+                fruits.push(createFruit());
+            } else if (frameCounter >= GENERATE_FRAME_INTERVAL) {
+                frameCounter = 0;
+            }
+            
+            // 额外: 如果水果太少(低于6)且当前没有大批量生成,立刻补充
+            if (fruits.length < 6 && frameCounter % 10 === 0) {
+                fruits.push(createFruit());
+            }
+            
+            drawScene();
+            
+            // 继续动画
+            animationId = requestAnimationFrame(updateLoop);
+        }
+        
+        // ---------- MediaPipe 手势检测初始化 ----------
+        async function initHandTracking() {
+            // 创建隐藏的视频元素（用于手势捕捉，不干扰纯白背景）
+            videoElement = document.createElement('video');
+            videoElement.setAttribute('autoplay', '');
+            videoElement.setAttribute('playsinline', '');
+            videoElement.style.position = 'fixed';
+            videoElement.style.top = '-1000px';
+            videoElement.style.left = '-1000px';
+            videoElement.style.width = '320px';
+            videoElement.style.height = '240px';
+            videoElement.style.opacity = '0';
+            videoElement.style.pointerEvents = 'none';
+            document.body.appendChild(videoElement);
+            
+            // 获取摄像头权限
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+                videoElement.srcObject = stream;
+                await videoElement.play();
+                loadingMsgDiv.innerText = '✨ 手势模型加载中...';
+            } catch (err) {
+                console.error("摄像头错误", err);
+                loadingMsgDiv.innerText = '⚠️ 无法开启摄像头, 请检查权限';
+                handStatusDiv.innerText = '❌ 摄像头失败';
+                return false;
+            }
+            
+            // 初始化 MediaPipe Hands
+            hands = new Hands({
+                locateFile: (file) => {
+                    return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+                }
+            });
+            
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+            
+            // 处理检测结果
+            hands.onResults((results) => {
+                // 更新手部状态
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    const landmarks = results.multiHandLandmarks[0];
+                    // 食指指尖索引: 8 (MediaPipe 关键点)
+                    if (landmarks && landmarks[8]) {
+                        const tip = landmarks[8];
+                        // 归一化坐标 [0,1] -> canvas像素坐标，并做镜像翻转（因为摄像头是镜像，操作更自然）
+                        let xNorm = tip.x;
+                        let yNorm = tip.y;
+                        // 镜像左右翻转 (让手指移动方向和视觉一致)
+                        let mappedX = canvasWidth - (xNorm * canvasWidth);
+                        let mappedY = yNorm * canvasHeight;
+                        // 边界裁剪
+                        mappedX = Math.min(Math.max(mappedX, 0), canvasWidth);
+                        mappedY = Math.min(Math.max(mappedY, 0), canvasHeight);
+                        indexFingerPos = { x: mappedX, y: mappedY };
+                        handDetected = true;
+                        handStatusDiv.innerHTML = '🖐️ 食指空气墙 ✓';
+                        handStatusDiv.style.background = 'rgba(110, 170, 80, 0.8)';
+                    } else {
+                        handDetected = false;
+                        indexFingerPos = null;
+                        handStatusDiv.innerHTML = '☝️ 未见到食指';
+                        handStatusDiv.style.background = 'rgba(0,0,0,0.55)';
+                    }
+                } else {
+                    handDetected = false;
+                    indexFingerPos = null;
+                    handStatusDiv.innerHTML = '✋ 无手部';
+                    handStatusDiv.style.background = 'rgba(0,0,0,0.55)';
+                }
+                isModelLoading = false;
+                loadingMsgDiv.style.opacity = '0.6';
+                loadingMsgDiv.innerText = '✅ 手势就绪 | 食指触碰水果';
+                setTimeout(() => {
+                    if(loadingMsgDiv) loadingMsgDiv.style.opacity = '0';
+                }, 2000);
+            });
+            
+            // 启动连续检测 (通过定时器从视频流中捕捉帧)
+            const sendToHands = async () => {
+                if (!hands || !videoElement || videoElement.readyState < 2) return;
+                try {
+                    await hands.send({ image: videoElement });
+                } catch(e) {
+                    // 静默失败
+                }
+                // 以约30fps频率检测
+                setTimeout(() => { sendToHands(); }, 45);
+            };
+            
+            // 等待视频流稳定后开始检测
+            videoElement.addEventListener('loadeddata', () => {
+                sendToHands();
+            });
+            if (videoElement.readyState >= 2) sendToHands();
+            return true;
+        }
+        
+        // ---------- 启动游戏系统 ----------
+        function startGame() {
+            resizeCanvas();
+            fruits = initFruits(10);    // 开局10个水果
+            score = 0;
+            scoreSpan.innerText = '0';
+            frameCounter = 0;
+            handDetected = false;
+            indexFingerPos = null;
+            
+            // 开启动画循环
+            if (animationId) cancelAnimationFrame(animationId);
+            animationId = requestAnimationFrame(updateLoop);
+        }
+        
+        // 窗口自适应
+        window.addEventListener('resize', () => {
+            resizeCanvas();
+            // 重新映射空气墙缓存坐标保持视觉合理, 不用额外处理，下一帧会刷新坐标
+            if (indexFingerPos) {
+                // 临时保留相对坐标, 但确保位置信息在下一帧检测时更新，就不用额外处理
+            }
+        });
+        
+        // 初始化摄像头 & 手势，完成后开始游戏流程
+        async function bootstrap() {
+            await initHandTracking();
+            startGame();
+        }
+        
+        // 优雅处理页面退出时释放相机资源
+        window.addEventListener('beforeunload', () => {
+            if (videoElement && videoElement.srcObject) {
+                const tracks = videoElement.srcObject.getTracks();
+                tracks.forEach(track => track.stop());
+            }
+            if (animationId) cancelAnimationFrame(animationId);
+        });
+        
+        bootstrap();
+    })();
+</script>
+</body>
+</html>
